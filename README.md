@@ -1,5 +1,28 @@
 # kotobase
 
+`kotobase.disclosure-grant` adds recipient-bound key delivery to the encrypted
+CID plane. `release!` and `release-async!` verify an owner-rooted delegation
+chain and a signed, audience-bound request; check current policy/epoch and a
+scoped one-use nonce; then sign, commit and reread a delivery receipt before
+returning the encrypted key envelope. This is key-delivery evidence, not an
+`ExecutionReceipt` or proof of human reading. Queries still use `governed-read`.
+
+Grants carry the envelope's **CID only**. The envelope itself must remain behind
+the delivery service until the receipt is durable. Publishing recipient-encrypted
+keys beforehand would let recipients bypass this audit boundary. Ciphertext
+blocks may be public; sensitive grant/receipt metadata needs protected storage.
+
+The implementation reuses the canonical value codec, authority window and
+production hybrid crypto policy. It does not implement a KEM, PRE scheme,
+identity registry or live endpoint. Host ports supply qualified crypto, trusted
+key lookup and durable immutable storage. The first profile grants one exact
+encrypted object's raw CID; partial disclosure needs separately encrypted
+objects. `:propose-update` is delegation vocabulary, not an update execution API.
+
+See [`docs/disclosure-grants.edn`](docs/disclosure-grants.edn) for the contract
+and remaining rollout gates. Ayatori's `recipient-decryptor[-async]` consumes
+this protocol at the existing `:decrypt-fn` seam.
+
 [![CI](https://github.com/kotoba-lang/kotobase/actions/workflows/ci.yml/badge.svg)](https://github.com/kotoba-lang/kotobase/actions/workflows/ci.yml)
 
 The primary API is now `kotobase.core`: `open`, `transact!`, `datoms`, `q`,
@@ -13,6 +36,104 @@ remain compatibility and migration surfaces only. See
 
 The document/stream `kotobase.store/IStore` section below is a legacy
 compatibility surface; new database backends must not target it.
+
+Every governed cross-protocol execution can be closed by the versioned
+`ExecutionManifest`, `RequestEnvelope`, and `ExecutionReceipt` records in
+`kotobase.execution-contract`. They bind an exact data commit, policy snapshot,
+revocation epoch, semantic query digest, request digest, result root, and
+measured cost without making one query language, wire codec, mutable head, or
+storage provider canonical. Validation is exact and fail closed; see
+[`docs/ADR-execution-contract.md`](docs/ADR-execution-contract.md).
+
+`kotobase.governed-execution` is where those records are produced rather than
+described. `execute!` (and `execute-async!` on Workers) binds the signed
+`RequestEnvelope` to the query that will actually run, decides expiry, the
+current revocation epoch and nonce freshness against host-supplied state,
+runs the guarded read, and commits a signed `ExecutionReceipt` before any row
+is returned. The identifiers in that receipt are computed, not accepted:
+`:execution/manifest`, `:request/digest` and `:result/root` are the canonical
+addresses of the manifest, the envelope and the rows that were served, so an
+auditor can re-derive each one and a record edited in any field stops matching
+what cites it. `kotobase.execution-identity` names that codec
+(`kotoba.value.codec/value-cid`); only the physical plan digest and the cost
+remain the host's answers. The receipt's signature is verified before the
+record is written, and the manifest's before the nonce is spent. A policy refusal produces a deny
+receipt on the same plane; an evaluator crash does not, because it is not an
+authority decision. `kotobase.causal-commit/execution-receipt-sink` is the
+canonical-CID implementation of that commit: it writes at an exact immutable
+basis and rereads the record before acknowledging.
+
+`kotobase.evidence` is the one plane those receipts are compared on. It lifts
+a source plane's record onto a version 1 `ExecutionReceipt` under a rule it
+cannot break — the supplement must be exactly the fields the source does not
+carry, so laundering a field the source answers and omitting one it does not
+are both refused — which makes the distance from each plane to the contract a
+number rather than a claim. A library that writes its own records
+defines its own plane and hands it in, because a carrier for records written
+elsewhere could only live here as a copy of their shape. Effect admissions and
+artifact builds are evidence of a different subject — they have no query plan and no served result — so
+they lift onto `kotobase.effect-contract`, which binds an action, a resource,
+the code lock the bytes were admitted under and the effects granted. Both
+contracts share one vocabulary, so two subjects do not mean two languages. See
+[`docs/ADR-evidence-plane.md`](docs/ADR-evidence-plane.md).
+
+`kotobase.governed-read` is the one read path that serves rows and leaves
+evidence. It binds the trust decision being exercised — an allow, a read, this
+tenant, exactly these resources, and the principal the signed envelope names —
+then runs the governed execution with the canonical CID sink wired in, so rows
+return only after the ExecutionReceipt has been committed and read back. It
+replaces the disclosure read path, which committed a receipt that answered one
+of the contract's eight fields.
+
+`kotobase.governed-effect` (and `execute-async!` on Workers) is the
+effect-side twin of `governed-read`: it
+validates an EffectRequest, binds the envelope's code lock to the package
+being admitted, decides runtime authority, runs `kotobase.admission/guard!`
+unchanged — so the audit is still durable before the effect runs — and then
+commits an EffectReceipt bound to the granted set the admission computed and
+the outcome the effect named. A read's receipt can bind its result because
+reading is repeatable; an effect's is written afterwards because an outcome
+does not exist until the effect has run, which is why the audit and the
+receipt are two records answering two questions rather than one record written
+twice.
+
+`kotobase.conformance` checks the contract's stated purpose instead of
+asserting it: given the receipts and rows from two or more frontends handed
+the same request, it refuses unless they agree about the request and about the
+answer, while permitting the plan digest, cost, build and signature to differ.
+It also reports what it found on the way — a result root is the address of the
+rows *as served*, so two conformant frontends serving the same multiset in
+different orders produce different roots, and comparing frontends by that
+field is asking the wrong question.
+
+`kotobase.execution-keys` answers *which* key, not just whether some key
+signed. A signature names the key that made it, and the verifier refuses it
+unless a registry says that key id, under that algorithm, was authorised to
+sign that kind of record for this tenant at this revocation epoch — with the
+tenant and epoch supplied by the execution rather than by whatever the
+verifier was built with. A registry that returns nothing refuses; that is the
+likeliest way for a key check to pass silently.
+
+`kotobase.metering` counts what an execution spent, at the seam between
+`kotobase.core` and the provider: how many times blocks were requested, how
+many bytes came back, and how many times the caller had to wait for an answer
+before it could ask the next question. That last number is what a pack layout
+exists to reduce and what a wall clock on a loaded machine cannot tell you.
+`:cache-profile` takes two meters rather than one — a cache in front of a
+single decorator is invisible to it and a cache behind it is the provider's
+business — so a meter above a cache and one below it derive how much the cache
+absorbed: `:hot` when nothing reached the provider, `:cold` when everything
+did, `:warm` in between. The same cache is cold on the read that fills it and
+hot on the next one, which is why the field is worth measuring per execution
+rather than configuring per host. With one meter it stays the caller's word
+and `:unmeasured` is the honest value.
+
+`kotobase.causal-commit` is the canonical causal-identity adapter. It commits
+identity transitions and LLM/model/agent authority decisions against an exact
+immutable basis CID without consulting or publishing a mutable ref. The permanent projection contains attributed
+records, decision bases, and content addresses—not raw identity evidence or
+credentials. `kotobase.causal-trust` remains the explicitly named numeric-
+revision compatibility route; the two basis types are never translated.
 
 **The datom database of the kotoba stack.** kotobase persists, indexes,
 queries, and time-versions the datom model that the
@@ -32,7 +153,12 @@ Datomic:
   transports; PostgreSQL, D1, and mutable IPNS/ref adapters are compatibility
   surfaces and cannot select canonical truth — see
   [`docs/storage-architecture.md`](docs/storage-architecture.md). IPLD is the
-  canonical encoding in every deployment.
+  canonical encoding in every deployment. **Where those blocks physically sit
+  is a separate layer**: blocks are packed into CARv2 archives
+  (`io-ipld-car`) and read back by byte range, so a block's identity stays its
+  own CID while its location is `(pack CID, offset, length)`. One object per
+  CID remains a legal backend profile; it is no longer the default one
+  (superproject ADR-2608160100).
 - **the datom (triple/EAV) itself**, immutable and content-addressed — the
   logical model every query surface shares. It is the right base for a stack
   serving many protocols because a relational row, an RDF quad, a property
@@ -56,7 +182,9 @@ it produced a stack in which every query protocol was expected to route
 through Datalog, which is not what the surfaces that exist actually do.
 
 "kotobase" is the umbrella over the datom-plane repos (bottom-up): content
-addressing (`ipld`/`multiformats`/`dag-cbor`) → content-addressed storage
+addressing (`ipld`/`multiformats`/`dag-cbor`) → block packing
+(`io-ipld-car`, CARv2 — a block's CID is its identity, the pack is its
+location) → content-addressed storage
 (`prolly-tree`) → immutable commit chain / time (`commit-dag`) → 4 covering
 indexes (`arrangement`, query layer in `datalog`) → transact/datoms/q/pull
 (`kotobase-engine`) → CACAO client (`kotobase-client`) → edge runtime
@@ -135,6 +263,45 @@ model) is already a minimal incidence relation with three named endpoints, so
 kotobase's Datalog-visible datom shape and its IPLD storage shape share one
 vocabulary top to bottom. A *tree* — binary, unlabelled parent/child — is
 just the special case of this graph with exactly one anonymous endpoint role.
+
+### What is vocabulary here, and what is wired
+
+Everything above describes the model. Two parts of it are **not** carried by
+the query engine today, and this section exists so a reader does not infer
+that they are. Recorded in `com-junkawasaki/root` ADR
+`adr-2608201500-incidence-is-the-vocabulary-the-query-engine-stops-at-triples`.
+
+| claim | wired? | where it stops |
+| --- | --- | --- |
+| every block's boundary is walkable | **yes** | `ipld/links` returns `∂(i)` |
+| a link occupies a labelled position | **yes, in the block** | the map key is the `role` |
+| the CID is the relation's identity | **yes** | canonical DAG-CBOR over `∂(i)` |
+| a query can *read* an endpoint's `role` | **no** | `datalog` clauses are `[s p o]` — arity 3, positional, no labels |
+| a query can read `sign` or `mult` | **no** | neither has a position in a triple |
+
+So the incidence framing is exact for **storage** and role-erased for
+**query**. `[e a v]` is the base case of the model, and it is also, today, the
+*only* case the query layer implements. Generalizing `datalog` from a
+positional triple to a labelled boundary is open work, not a description of
+what runs — see that library's own "The relation model above this one".
+
+One consequence worth stating plainly, because it points the other way from
+the usual disclaimer: **`role`, `sign` and `mult` cannot be added to a
+positional clause after the fact.** Erasing labels is not reversible. That
+makes the order in which this gets generalized load-bearing rather than a
+matter of taste.
+
+Two further separations the vocabulary makes and the engine does not:
+
+- **`Hash` vs `Link`.** `Link` is a first-class value (IPLD Data Model kind
+  `:link`, DAG-CBOR tag 42) and drives the `:vaet` reverse index through
+  `ref?`. A bare **multihash** — the key IPNI actually indexes, and the thing
+  that answers *where is it* rather than *what is it* — has no type; in
+  `io-ipni-specs` an EntryChunk's `entries` are documented as
+  "multihashes (octet vectors), not CIDs" and validated per field.
+- **identity vs naming.** `:kotoba.graph/cid` is identity, `:kotoba.graph/head`
+  is naming (`kotoba.protocol.ref`: identity is a hash, a name is a mutable
+  pointer to a hash). Both are strings at a clause position.
 
 ## `IStore` — the storage seam
 
@@ -241,7 +408,7 @@ uses `kotoba.semantic-code`'s canonical DAG-CBOR definition, namespace,
 closure, and execution blocks with real CIDv1 verification. Run it with:
 
 ```bash
-clojure -M:integration
+kbb -M:integration
 ```
 
 CID possession is never authority. Package signatures/admission, CACAO,
@@ -260,6 +427,14 @@ Use `promise-runtime` in ClojureScript; other completion models can inject the
 same `resolve`/`then`/`all` algebra. CI compiles and executes this path under
 Node as real ClojureScript rather than relying only on the synchronous JVM test.
 
+`kotobase.causal-commit`, `kotobase.guarded`, and
+`kotobase.authorized-query` also have a real Worker completion path. A remote
+LLM/model/agent authorizer, the query evaluator, every immutable block write,
+the exact-CID reread, and the receipt sink are awaited in order. Any rejection
+withholds the rows. The same public `causal-commit/read!`, `receipt-at`, and
+ledger adapter remain synchronous on the JVM and Promise-returning in
+ClojureScript.
+
 ## Comparing this shape with OrbitDB / Ceramic / ActorDB
 
 [`capability-bench/`](capability-bench/) implements the OrbitDB
@@ -277,8 +452,8 @@ license you to conclude.
 
 ```bash
 cd capability-bench && npm install && npm run setup
-nbb --classpath "$(nbb setup.cljs --print-classpath)" verify.cljs   # all four must agree
-nbb --classpath "$(nbb setup.cljs --print-classpath)" run.cljs --fvm
+kbb --backend sci --classpath "$(kbb --backend sci setup.cljk --print-classpath)" verify.cljs   # all four must agree
+kbb --backend sci --classpath "$(kbb --backend sci setup.cljk --print-classpath)" run.cljs --fvm
 ```
 
 The same module also measures the **semantic code graph** —
@@ -304,6 +479,7 @@ Workers) inject a `fetch`-based `xrpc` and serve the app API straight off the
 > `io.github.kotoba-lang/kotobase`; see `docs/coverage.edn`'s resolved M5 note.
 
 ```bash
-clojure -M:test     # LocalStore + KotobaseStore both satisfy the IStore contract
-clojure -M:cljs-test -m cljs.main ... # compile/run Promise IStore code graph
+kbb -M:test     # LocalStore + KotobaseStore both satisfy the IStore contract
+kbb -M:cljs-test -m cljs.main -co '{:target :nodejs :output-to "target/p2-tests.js" :output-dir "target/p2-out" :optimizations :none :main kotobase.async-test-runner}' -c kotobase.async-test-runner
+node target/p2-tests.js              # real Promise causal-commit/guarded path
 ```

@@ -52,6 +52,18 @@
   (or (get cids label)
       (throw (ex-info "no CID fixture for label" {:label label}))))
 
+(def portable-cid (cid "portableexecutionidentity"))
+
+(defn portable-identity []
+  {:format :kotoba.execution-identity/v1
+   :plan-cid (cid "plan") :code-closure-cid (cid "closure")
+   :artifact-cid (cid "artifact") :compiler-contract (cid "compiler")
+   :component-cid (cid "component") :wit-world-cid (cid "world")
+   :package-lock-cid (cid "lock") :policy-cid (cid "policy")
+   :policy-decision-cid (cid "decision") :db-basis (cid "basis")
+   :grant-cids [(cid "grant")] :approval-cids [(cid "approval")]
+   :runtime-identity (cid "runtime") :input-cid (cid "input")
+   :outcome-cid (cid "outcome") :host-receipt-cids [(cid "hostreceipt")]})
 
 (defn verify [cid block] (= cid (:cid block)))
 
@@ -65,19 +77,6 @@
       :read (store/-read backend (:stream params) (:since params)))))
 (defn record [cid deps effects]
   {:cid cid :block {:cid cid} :dependency-cids deps :effects effects})
-
-(def portable-cid (cid "portableexecutionidentity"))
-
-(defn portable-identity []
-  {:format :kotoba.execution-identity/v1
-   :plan-cid (cid "plan") :code-closure-cid (cid "closure")
-   :artifact-cid (cid "artifact") :compiler-contract (cid "compiler")
-   :component-cid (cid "component") :wit-world-cid (cid "world")
-   :package-lock-cid (cid "lock") :policy-cid (cid "policy")
-   :policy-decision-cid (cid "decision") :db-basis (cid "basis")
-   :grant-cids [(cid "grant")] :approval-cids [(cid "approval")]
-   :runtime-identity (cid "runtime") :input-cid (cid "input")
-   :outcome-cid (cid "outcome") :host-receipt-cids [(cid "hostreceipt")]})
 
 (deftest definitions-are-verified-indexed-and-queryable
   (let [s (local/local-store)]
@@ -119,6 +118,28 @@
                                                    (record "cid-main" ["absent"] []))
                              (catch #?(:clj clojure.lang.ExceptionInfo
                                        :cljs cljs.core.ExceptionInfo) e e)))))))))
+
+(deftest untrusted-admission-derives-projection-and-ignores-caller-fields
+  (let [s (local/local-store)
+        block {:cid "cid-safe" :semantic-effects ["graph-write"]}
+        admit (fn [cid actual]
+                (when (and (= cid "cid-safe") (= actual block))
+                  {:cid cid :block actual :dependency-cids []
+                   :effects ["graph-write"] :visibility :private}))]
+    (code/put-definition-admitted!
+     s admit {:cid "cid-safe" :block block
+              :effects [] :dependency-cids [] :visibility :public})
+    (is (= #{"graph-write"} (code/transitive-effects s "cid-safe")))
+    (is (= :private
+           (:code.definition/visibility (code/get-definition s "cid-safe"))))
+    (is (= :code/admission-denied
+           (:problem
+            (ex-data
+             (try (code/put-definition-admitted!
+                   s (constantly nil) {:cid "cid-evil" :block {:cid "cid-evil"}})
+                  nil
+                  (catch #?(:clj clojure.lang.ExceptionInfo
+                            :cljs cljs.core.ExceptionInfo) e e))))))))
 
 (deftest artifact-cache-is-keyed-by-code-and-compiler
   (let [s (local/local-store)]
@@ -247,6 +268,7 @@
                            {:artifact-cid "cid-wasm" :code-root-cid "cid-main"
                             :compiler-contract-cid "cid-compiler" :bytes [0]})
                 :verify-artifact (constantly true)
+                :verify-artifact-host (constantly true)
                 :verify-artifact-internal (constantly true)
                 :run (fn [_ input] (inc input))}
           first-run (code/execute-code-root! target opts)
@@ -308,21 +330,20 @@
 
 (deftest sealed-views-hash-qualified-names-and-three-way-merges
   (let [s (local/local-store)
-        sealed (assoc (record (cid "secret") [] ["graph-read"])
-                      :visibility :sealed :sealed-block-cid (cid "envelope"))]
+        sealed (assoc (record "bafysecret" [] ["graph-read"])
+                      :visibility :sealed :sealed-block-cid "bafyenvelope")]
     (code/put-definition! s verify verify sealed)
-    (let [hidden (code/definition-view s (cid "secret") (constantly false))]
-      (is (= (cid "envelope") (:code.definition/sealed-block-cid hidden)))
+    (let [hidden (code/definition-view s "bafysecret" (constantly false))]
+      (is (= "bafyenvelope" (:code.definition/sealed-block-cid hidden)))
       (is (nil? (:code.definition/block hidden)))
       (is (nil? (:code.definition/effects hidden))))
     (is (some? (:code.definition/block
-                (code/definition-view s (cid "secret") (constantly true)))))
+                (code/definition-view s "bafysecret" (constantly true)))))
     (code/put-namespace-commit!
      s verify verify {:cid "cid-ns" :block {:cid "cid-ns"} :parents []
-               :bindings {"app/main" (cid "secret")}})
-    (is (= (cid "secret")
-           (code/resolve-qualified-name
-            s "cid-ns" (str "app/main#" (subs (cid "secret") 0 10)))))
+               :bindings {"app/main" "bafysecret"}})
+    (is (= "bafysecret"
+           (code/resolve-qualified-name s "cid-ns" "app/main#bafy")))
     (is (= :namespace/hash-qualifier-mismatch
            (:problem
             (ex-data

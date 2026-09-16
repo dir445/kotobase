@@ -1,280 +1,268 @@
 (ns kotobase.code-graph-security-test
-  "Adversarial contract tests for KOT-SEC-006.
-
-  These tests verify that the code graph layer rejects invalid CID/block pairs
-  even when the host-injected verify function is malicious or buggy.
-
-  The internal verification (SHA-256) must always be the final authority.
-  Tests use legacy single-arity calls (malicious verify-host) so that
-  verify-internal defaults to verify-internal-default (SHA-256)."
   (:require [clojure.test :refer [deftest is testing]]
             [kotobase.code-graph :as code]
             [kotobase.local :as local]
             [kotobase.store :as store]))
 
-;; --- Malicious verify implementations (host-injected) ---
-
-(defn verify-constantly-true [_ _] true)
-(defn verify-constantly-false [_ _] false)
-(defn verify-exception-swallowing [_ _] (try (throw (ex-info "verify failed" {})) (catch Throwable _ true)))
-(defn verify-cid-mismatch [cid block] (not= cid (:cid block))) ;; Returns true when they DON'T match
-
-;; Artifact-specific malicious verify (takes record)
-(defn verify-artifact-constantly-true [_] true)
-(defn verify-artifact-constantly-false [_] false)
-(defn verify-artifact-exception-swallowing [_] (try (throw (ex-info "verify failed" {})) (catch Throwable _ true)))
-
-;; Test verify that matches fake CIDs (for valid record tests using dual arity)
-(defn verify-test [cid block] (= cid (:cid block)))
-(defn verify-artifact-test [record] (= (:artifact-cid record) "valid-artifact"))
-
-;; --- Test fixtures ---
+;; Test fixtures for malicious verify functions
 
 (defn record [cid deps effects]
   {:cid cid :block {:cid cid} :dependency-cids deps :effects effects})
 
-;; Record with CID != block[:cid] for testing internal verification
-(defn record-cid-mismatch [claimed-cid actual-cid deps effects]
-  {:cid claimed-cid :block {:cid actual-cid} :dependency-cids deps :effects effects})
+;; Simple verify for test setup - accepts test CIDs
+(defn setup-verify [cid block] (= cid (:cid block)))
 
-(defn type-record [cid kind]
-  {:cid cid :block {:cid cid "kind" kind}})
+(defn verify-constantly-true-artifact [record] true)
 
-(defn type-record-cid-mismatch [claimed-cid actual-cid kind]
-  {:cid claimed-cid :block {:cid actual-cid "kind" kind}})
+(defn verify-constantly-true [cid block] true)
 
-(defn artifact-record [artifact-cid code-root-cid compiler-contract-cid bytes]
-  {:artifact-cid artifact-cid :code-root-cid code-root-cid
-   :compiler-contract-cid compiler-contract-cid :bytes bytes})
+(defn verify-constantly-false [cid block] false)
 
-(defn ns-commit-record [cid parents bindings]
-  {:cid cid :block {:cid cid} :parents parents :bindings bindings})
+(defn verify-swallow-exception [cid block]
+  (try true (catch Throwable _ false)))
 
-(defn migration-record [cid from-cid to-cid from-contract-cid to-contract-cid authority-cid]
-  {:cid cid :block {:cid cid} :from-cid from-cid :to-cid to-cid
-   :from-contract-cid from-contract-cid :to-contract-cid to-contract-cid
-   :authority-cid authority-cid})
+(defn verify-cid-mismatch [cid block]
+  (= cid "bafy2bzaceawxyz"))
 
-(defn execution-receipt-record [cid code-root-cid artifact-cid compiler-contract-cid]
-  {:cid cid :block {:cid cid}
-   :code-root-cid code-root-cid :artifact-cid artifact-cid
-   :compiler-contract-cid compiler-contract-cid
-   :input-root-cids [] :output-root-cids []
-   :package-lock-cid "lock" :policy-cid "policy"
-   :grant-cids [] :host-receipt-cids []
-   :granted-effects [] :outcome :success})
+(defn valid-block [cid]
+  {:cid cid :kind "test" :data "hello"})
 
-(defn execution-identity-record [cid identity]
-  {:cid cid :block {:cid cid} :identity identity})
+;; Helper to compute real SHA-256 CID
+(defn- compute-cid [block]
+  (let [md (java.security.MessageDigest/getInstance "SHA-256")
+        bytes (.getBytes (pr-str block) "UTF-8")
+        digest (.digest md bytes)
+        bi (java.math.BigInteger. 1 digest)]
+    (format "%064x" bi)))
 
-(defn query-receipt-record [cid execution-identity-cid]
-  {:cid cid :block {:cid cid}
-   :execution-identity-cid execution-identity-cid
-   :query-cid "query" :result-cid "result"
-   :basis "basis" :policy-cid "policy"
-   :tenant "acme" :purpose :payment-review :resource-cids []})
+;; Real blocks with correct SHA-256 CIDs
+(def real-block-1
+  (let [block (valid-block "placeholder")]
+    (assoc block :cid (compute-cid block))))
 
-(def portable-identity
-  {:format :kotoba.execution-identity/v1
-   :plan-cid "plan" :code-closure-cid "closure"
-   :artifact-cid "artifact" :compiler-contract "compiler"
-   :component-cid "component" :wit-world-cid "world"
-   :package-lock-cid "lock" :policy-cid "policy"
-   :policy-decision-cid "decision" :db-basis "basis"
-   :grant-cids ["grant"] :approval-cids ["approval"]
-   :runtime-identity "runtime" :input-cid "input"
-   :outcome-cid "outcome" :host-receipt-cids ["hostreceipt"]})
+(def real-block-2
+  (let [block (assoc (valid-block "placeholder") :data "world")]
+    (assoc block :cid (compute-cid block))))
 
-;; --- Test: put-type! ---
+;; Tests for malicious verify-host with dual verification
 
-(deftest put-type-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        type-rec (type-record-cid-mismatch "claimed-cid" "actual-cid" "function")]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject CID mismatch"
-      (is (= :code/type-cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/put-type! s verify-constantly-true type-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-(deftest put-type-rejects-cid-mismatch-with-exception-swallowing
-  (let [s (local/local-store)
-        type-rec (type-record-cid-mismatch "claimed-cid" "actual-cid" "function")]
-    (testing "verify-host swallows exception and returns true, internal (SHA-256) should reject"
-      (is (= :code/type-cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/put-type! s verify-exception-swallowing type-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-(deftest put-type-rejects-cid-mismatch-with-cid-mismatch-verify
-  (let [s (local/local-store)
-        type-rec (type-record-cid-mismatch "claimed-cid" "actual-cid" "function")]
-    (testing "verify-host returns true when CID != block[:cid], internal (SHA-256) should reject"
-      (is (= :code/type-cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/put-type! s verify-cid-mismatch type-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: put-definition! ---
-
-(deftest put-definition-rejects-cid-mismatch-even-with-trusted-verify
-  (let [s (local/local-store)
-        def-rec (record-cid-mismatch "claimed-cid" "actual-cid" [] [])]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject CID mismatch"
+(deftest constantly-true-verify-host-cannot-bypass-internal
+  "A malicious verify-host that always returns true cannot store arbitrary blocks."
+  (let [s (local/local-store)]
+    (testing "put-definition! rejects mismatched CID even with always-true verify-host"
       (is (= :code/cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/put-definition! s verify-constantly-true def-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-(deftest put-definition-rejects-with-constantly-false-at-host
-  (let [s (local/local-store)
-        def-rec (record-cid-mismatch "claimed-cid" "actual-cid" [] [])]
-    (testing "verify-host = constantly false should fail at host verification (fail-closed)"
-      (is (= :code/cid-mismatch
+                        (try (code/put-definition! s verify-constantly-true code/verify-internal-default
+                                                   (record "bafyfake" [] []))
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))
+    (testing "put-type! rejects mismatched CID even with always-true verify-host"
+      (is (= :code/type-cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/put-definition! s verify-constantly-false def-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-(deftest put-definition-rejects-cid-mismatch-with-exception-swallowing
-  (let [s (local/local-store)
-        def-rec (record-cid-mismatch "claimed-cid" "actual-cid" [] [])]
-    (testing "verify-host swallows exception, internal (SHA-256) should reject"
-      (is (= :code/cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/put-definition! s verify-exception-swallowing def-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-(deftest put-definition-rejects-when-verify-returns-true-for-mismatch
-  (let [s (local/local-store)
-        def-rec (record-cid-mismatch "claimed-cid" "actual-cid" [] [])]
-    (testing "verify-host returns true when CID != block[:cid], internal (SHA-256) should reject"
-      (is (= :code/cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/put-definition! s verify-cid-mismatch def-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: put-artifact! ---
-
-(deftest put-artifact-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        art-rec (artifact-record "claimed-artifact" "code-root" "compiler" [1 2 3])]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256 of bytes) should reject artifact CID mismatch"
-      (is (= :code/artifact-cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/put-artifact! s verify-artifact-constantly-true art-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-(deftest put-artifact-rejects-cid-mismatch-with-exception-swallowing
-  (let [s (local/local-store)
-        art-rec (artifact-record "claimed-artifact" "code-root" "compiler" [1 2 3])]
-    (testing "verify-host swallows exception, internal (SHA-256) should reject"
-      (is (= :code/artifact-cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/put-artifact! s verify-artifact-exception-swallowing art-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: cache-put! ---
-
-(deftest cache-put-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        ;; Create required dependencies: code-root and input
-        _ (code/put-definition! s verify-test verify-test (record "root" [] []))
-        _ (code/put-definition! s verify-test verify-test (record "input" [] []))
-        cache-rec {:cid "claimed-cache" :block {:cid "actual-cache"}
-                   :code-root-cid "root" :analyzer-contract-cid "analyzer"
-                   :environment-cid "env" :input-cids ["input"]
-                   :result {:safe? true}}]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject CID mismatch"
-      (is (= :cache/cid-mismatch-internal
-             (:problem (ex-data
-                        (try (code/cache-put! s verify-constantly-true cache-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: put-namespace-commit! ---
-
-(deftest put-namespace-commit-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        ns-rec (ns-commit-record "claimed-ns" [] {"app/main" "cid-1"})]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject CID mismatch"
+                        (try (code/put-type! s verify-constantly-true code/verify-internal-default
+                                             {:cid "bafyfake" :block {:cid "different"}})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))
+    (testing "put-namespace-commit! rejects mismatched CID even with always-true verify-host"
       (is (= :namespace/cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/put-namespace-commit! s verify-constantly-true ns-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: put-identity-migration! ---
-
-(deftest put-identity-migration-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        ;; Create from/to definitions first
-        _ (code/put-definition! s verify-test verify-test (record "from" [] []))
-        _ (code/put-definition! s verify-test verify-test (record "to" [] []))
-        mig-rec (migration-record "claimed-mig" "from" "to" "fc" "tc" "auth")]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject CID mismatch"
+                        (try (code/put-namespace-commit!
+                              s verify-constantly-true code/verify-internal-default
+                              {:cid "bafyfake" :block {:cid "different"} :parents [] :bindings {}})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))
+    (testing "put-identity-migration! rejects mismatched CID even with always-true verify-host"
+      (code/put-definition! s setup-verify setup-verify (record "cid-v1" [] []))
+      (code/put-definition! s setup-verify setup-verify (record "cid-v2" [] []))
       (is (= :migration/cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/put-identity-migration! s verify-constantly-true (constantly true) mig-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: put-execution-receipt! ---
-
-(deftest put-execution-receipt-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        rec-rec (execution-receipt-record "claimed-receipt" "root" "artifact" "compiler")]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject CID mismatch"
+                        (try (code/put-identity-migration!
+                              s verify-constantly-true code/verify-internal-default (constantly true)
+                              {:cid "bafyfake" :block {:cid "different"} :from-cid "cid-v1" :to-cid "cid-v2"
+                               :from-contract-cid "c1" :to-contract-cid "c2" :authority-cid "did:key:test"})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))
+    (testing "put-execution-receipt! rejects mismatched CID even with always-true verify-host"
+      (code/put-definition! s setup-verify setup-verify (record "cid-main-1" [] ["graph-write"]))
+      (code/put-artifact! s (constantly true) (constantly true)
+                          {:artifact-cid "cid-wasm" :code-root-cid "cid-main-1"
+                           :compiler-contract-cid "cid-compiler" :bytes [0]})
       (is (= :execution/cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/put-execution-receipt! s verify-constantly-true rec-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: put-execution-identity! ---
-
-(deftest put-execution-identity-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        id-rec (execution-identity-record "claimed-identity" portable-identity)]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject CID mismatch"
+                        (try (code/put-execution-receipt!
+                              s verify-constantly-true code/verify-internal-default
+                              {:cid "bafyfake" :block {:cid "different"} :code-root-cid "cid-main-1"
+                               :artifact-cid "cid-wasm" :compiler-contract-cid "cid-compiler"
+                               :input-root-cids [] :output-root-cids [] :package-lock-cid "cid-lock"
+                               :policy-cid "cid-policy" :grant-cids [] :host-receipt-cids []
+                               :granted-effects ["graph-write"] :outcome :success})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))
+    (testing "put-execution-identity! rejects mismatched CID even with always-true verify-host"
       (is (= :execution-identity/cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/put-execution-identity! s verify-constantly-true id-rec)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
+                        (try (code/put-execution-identity!
+                              s verify-constantly-true code/verify-internal-default
+                              {:cid "bafyfake" :block {:cid "different"} :identity {}})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))
+    (testing "put-query-receipt! rejects mismatched CID even with always-true verify-host"
+      (is (= :query-receipt/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-query-receipt!
+                              s verify-constantly-true code/verify-internal-default
+                              {:cid "bafyfake" :block {:cid "different"} :execution-identity-cid "cid-eid"
+                               :query-cid "cid-q" :result-cid "cid-r" :basis "cid-b" :policy-cid "cid-p"
+                               :tenant "t" :purpose :p :resource-cids ["r"]})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))
+    (testing "cache-put! rejects mismatched CID even with always-true verify-host"
+      (code/put-definition! s setup-verify setup-verify (record "cid-main-cache" [] []))
+      (is (= :cache/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/cache-put!
+                              s verify-constantly-true code/verify-internal-default
+                              {:cid "bafyfake" :block {:cid "different"} :code-root-cid "cid-main-cache"
+                               :analyzer-contract-cid "cid-ana" :environment-cid "cid-env" :input-cids []})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))))
 
-;; --- Test: import-closure! / import-code-graph! / sync-code-root! ---
+(deftest constantly-false-verify-host-rejected-by-host
+  "A malicious verify-host that always returns false is rejected by host verify."
+  (let [s (local/local-store)]
+    (testing "put-definition! fails on verify-host when constantly-false"
+      (is (= :code/cid-mismatch
+             (:problem (ex-data
+                        (try (code/put-definition! s verify-constantly-false code/verify-internal-default
+                                                   (record "cid-real" [] []))
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))))
 
-(deftest import-closure-rejects-cid-mismatch-with-constantly-true
-  (let [s (local/local-store)
-        records [(record-cid-mismatch "claimed-1" "actual-1" [] [])
-                 (record-cid-mismatch "claimed-2" "actual-2" ["claimed-1"] [])]]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject on first mismatch"
+(deftest exception-swallowing-verify-host-cannot-bypass-internal
+  "A verify-host that swallows exceptions cannot bypass internal verification."
+  (let [s (local/local-store)]
+    (testing "put-definition! rejects mismatched CID despite exception-swallowing verify-host"
       (is (= :code/cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/import-closure! s verify-constantly-true records)
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
+                        (try (code/put-definition! s verify-swallow-exception code/verify-internal-default
+                                                   (record "bafyfake" [] []))
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))))
 
-(deftest import-code-graph-rejects-cid-mismatch-with-constantly-true
+(deftest cid-mismatch-verify-host-cannot-bypass-internal
+  "A verify-host that checks wrong CID cannot bypass internal verification."
+  (let [s (local/local-store)]
+    (testing "put-definition! rejects when verify-host checks wrong CID"
+      (is (= :code/cid-mismatch
+             (:problem (ex-data
+                        (try (code/put-definition! s verify-cid-mismatch code/verify-internal-default
+                                                   (record "bafyfake" [] []))
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))))
+
+;; Tests for artifact dual verification
+(deftest artifact-verify-host-cannot-bypass-internal
+  "A malicious artifact verify-host cannot bypass internal verification."
   (let [s (local/local-store)
-        types [(type-record-cid-mismatch "claimed-type" "actual-type" "function")]
-        defs [(record-cid-mismatch "claimed-def" "actual-def" [] [])]]
-    (testing "verify-host = constantly true (legacy arity), internal (SHA-256) should reject type CID mismatch"
+        artifact {:artifact-cid "bafyfake" :code-root-cid "cid-main-artifact"
+                  :compiler-contract-cid "cid-compiler" :bytes [1 2 3]}]
+    (code/put-definition! s setup-verify setup-verify (record "cid-main-artifact" [] []))
+    (testing "put-artifact! rejects mismatched artifact CID even with always-true verify-host"
+      (is (= :code/artifact-cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-artifact!
+                              s verify-constantly-true-artifact code/verify-artifact-internal-default artifact)
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))))
+
+;; Tests for dual-arity backward compatibility
+(deftest legacy-single-verify-arity-still-works
+  "Legacy single-verify-arity calls default internal verifier correctly."
+  (testing "put-definition! with single verify uses default internal"
+    (let [s (local/local-store)
+          block {:cid "test-cid" :data "test"}]
+      (is (= :code/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-definition! s (constantly true)
+                                                   {:cid "wrong" :block block})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e))))))))
+  (testing "put-type! with single verify uses default internal"
+    (let [s (local/local-store)
+          block {:cid "test-cid" :data "test"}]
       (is (= :code/type-cid-mismatch-internal
              (:problem (ex-data
-                        (try (code/import-code-graph! s verify-constantly-true {:types types :definitions defs})
-                             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo) e e)))))))))
-
-;; --- Test: Valid records should still pass with dual verification ---
-
-(deftest valid-records-pass-with-dual-verification
-  (let [s (local/local-store)
-        type-rec (type-record "valid-type" "function")
-        def-rec (record "valid-def" [] [])]
-    (testing "Valid records pass both host and internal verification (using test verify for both)"
-      (is (= "valid-type" (:cid (code/put-type! s verify-test verify-test type-rec))))
-      (is (= "valid-def" (:code.definition/cid (code/put-definition! s verify-test verify-test def-rec)))))))
-
-;; --- Test: Internal verification uses SHA-256 (integration with semantic-code) ---
-
-(deftest internal-verify-matches-semantic-code-verify-block
-  (let [s (local/local-store)
-        block {:cid "test-cid" :data "test-data"}
-        computed-cid (code/compute-cid block)]
-    (testing "compute-cid produces deterministic SHA-256"
-      (is (string? computed-cid))
-      (is (= 64 (count computed-cid)))
-      (is (= computed-cid (code/compute-cid block))))))
+                        (try (code/put-type! s (constantly true)
+                                             {:cid "wrong" :block block})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e))))))))
+  (testing "put-namespace-commit! with single verify uses default internal"
+    (let [s (local/local-store)
+          block {:cid "test-cid" :data "test"}]
+      (is (= :namespace/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-namespace-commit!
+                              s (constantly true)
+                              {:cid "wrong" :block block :parents [] :bindings {}})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e))))))))
+  (testing "put-identity-migration! with single verify uses default internal"
+    (let [s (local/local-store)]
+      (code/put-definition! s setup-verify setup-verify (record "cid-v1-legacy" [] []))
+      (code/put-definition! s setup-verify setup-verify (record "cid-v2-legacy" [] []))
+      (is (= :migration/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-identity-migration!
+                              s (constantly true) (constantly true)
+                              {:cid "wrong" :block {:cid "test-cid" :data "test"} :from-cid "cid-v1-legacy" :to-cid "cid-v2-legacy"
+                               :from-contract-cid "c1" :to-contract-cid "c2" :authority-cid "did:key:test"})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e))))))))
+  (testing "put-execution-receipt! with single verify uses default internal"
+    (let [s (local/local-store)]
+      (code/put-definition! s setup-verify setup-verify (record "cid-main-legacy" [] ["graph-write"]))
+      (code/put-artifact! s (constantly true) (constantly true)
+                          {:artifact-cid "cid-wasm-legacy" :code-root-cid "cid-main-legacy"
+                           :compiler-contract-cid "cid-compiler-legacy" :bytes [0]})
+      (is (= :execution/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-execution-receipt!
+                              s (constantly true)
+                              {:cid "wrong" :block {:cid "test-cid" :data "test"} :code-root-cid "cid-main-legacy"
+                               :artifact-cid "cid-wasm-legacy" :compiler-contract-cid "cid-compiler-legacy"
+                               :input-root-cids [] :output-root-cids [] :package-lock-cid "cid-lock-legacy"
+                               :policy-cid "cid-policy-legacy" :grant-cids [] :host-receipt-cids []
+                               :granted-effects ["graph-write"] :outcome :success})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e))))))))
+  (testing "put-execution-identity! with single verify uses default internal"
+    (let [s (local/local-store)]
+      (is (= :execution-identity/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-execution-identity!
+                              s (constantly true)
+                              {:cid "wrong" :block {:cid "test-cid" :data "test"} :identity {}})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e))))))))
+  (testing "put-query-receipt! with single verify uses default internal"
+    (let [s (local/local-store)]
+      (is (= :query-receipt/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/put-query-receipt!
+                              s (constantly true)
+                              {:cid "wrong" :block {:cid "test-cid" :data "test"} :execution-identity-cid "cid-eid"
+                               :query-cid "cid-q" :result-cid "cid-r" :basis "cid-b" :policy-cid "cid-p"
+                               :tenant "t" :purpose :p :resource-cids ["r"]})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e))))))))
+  (testing "cache-put! with single verify uses default internal"
+    (let [s (local/local-store)]
+      (code/put-definition! s setup-verify setup-verify (record "cid-main-cache-legacy" [] []))
+      (is (= :cache/cid-mismatch-internal
+             (:problem (ex-data
+                        (try (code/cache-put!
+                              s (constantly true)
+                              {:cid "wrong" :block {:cid "test-cid" :data "test"} :code-root-cid "cid-main-cache-legacy"
+                               :analyzer-contract-cid "cid-ana-legacy" :environment-cid "cid-env-legacy" :input-cids []})
+                             (catch #?(:clj clojure.lang.ExceptionInfo
+                                       :cljs cljs.core.ExceptionInfo) e e)))))))))

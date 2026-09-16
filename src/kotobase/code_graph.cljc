@@ -11,7 +11,6 @@
   (slow, mandatory, cryptographically enforced)."
   (:require [clojure.string :as str]
             [kotoba.abi.contract :as abi]
-            [kotoba.security.effect :as effect]
             [kotobase.store :as store])
   (:import [java.math BigInteger]
            [java.security MessageDigest]))
@@ -22,10 +21,10 @@
 (def analysis-cache "code.analysis-cache")
 (def namespace-commits "code.namespace-commits")
 (def execution-receipts "code.execution-receipts")
-(def execution-identities "code.execution-identities")
-(def query-receipts "code.query-receipts")
 (def identity-migrations "code.identity-migrations")
 (def retention-pins "code.retention-pins")
+(def execution-identities "code.execution-identities")
+(def query-receipts "code.query-receipts")
 (def datom-stream "code.datoms")
 (def retention-stream "code.retention-events")
 
@@ -122,9 +121,9 @@
          block (:code.definition/block record)]
      (require-value some? block :code/block-required {:cid cid})
      (require-value true? (boolean (verify-host cid block))
-                    :code/cid-mismatch {:cid cid})
+                  :code/cid-mismatch {:cid cid})
      (require-value true? (boolean (verify-internal cid block))
-                    :code/cid-mismatch-internal {:cid cid})
+                  :code/cid-mismatch-internal {:cid cid})
      (when-let [type-cid (:code.definition/type-cid record)]
        (require-value some? (get-type s type-cid)
                       :code/missing-type {:cid cid :type-cid type-cid}))
@@ -140,6 +139,30 @@
          (doseq [datom (definition-datoms record)]
            (store/-append s datom-stream {:datom datom}))
          record)))))
+
+(defn put-definition-admitted!
+  "Untrusted-boundary definition admission. ADMIT verifies CID and returns the
+  complete normalized projection derived from BLOCK. Caller-supplied
+  dependencies, effects, visibility, and type metadata are not accepted.
+
+  ADMIT receives `(cid block)` and returns a map accepted by
+  `definition-record`, or nil/false on rejection. Its CID and block must exactly
+  match the requested pair.
+  Dual verification (KOT-SEC-006): uses the same exact-match verifier for both
+  host and internal verification."
+  [s admit {:keys [cid block]}]
+  (require-value fn? admit :code/admitter-required {})
+  (require-value string? cid :code/invalid-cid {})
+  (require-value some? block :code/block-required {:cid cid})
+  (let [admitted (admit cid block)
+        exact-verify (fn [expected actual]
+                       (and (= expected cid) (= actual block)))]
+    (require-value map? admitted :code/admission-denied {:cid cid})
+    (require-value #(= cid (or (:cid %) (:code.definition/cid %))) admitted
+                   :code/admitted-cid-mismatch {:cid cid})
+    (require-value #(= block (or (:block %) (:code.definition/block %))) admitted
+                   :code/admitted-block-mismatch {:cid cid})
+    (put-definition! s exact-verify exact-verify admitted)))
 
 (defn get-definition [s cid]
   (store/-get s definitions cid))
@@ -191,7 +214,7 @@
        (filter #(contains? (transitive-effects s %) effect))
        sort vec))
 
-(defn- verify-artifact-internal-default
+(defn verify-artifact-internal-default
   "Default internal verifier for artifacts: recomputes artifact-cid from bytes."
   [record]
   (let [bytes (:bytes record)
@@ -433,7 +456,7 @@
        (if-let [existing (store/-get s execution-receipts cid)]
          (do (require-value #(= existing %) record
                             :execution/cid-record-conflict {:cid cid})
-           existing)
+             existing)
          (do
            (store/-put s execution-receipts cid record)
            (doseq [datom
@@ -491,7 +514,7 @@
                 [[:execution-identity/grant-cid (:grant-cids identity)]
                  [:execution-identity/approval-cid (:approval-cids identity)]
                  [:execution-identity/host-receipt-cid (:host-receipt-cids identity)]]
-                value values]
+               value values]
           (store/-append s datom-stream {:datom [:db/add cid attribute value]}))
         record)))))
 
@@ -654,7 +677,7 @@
          needed-types (set (keep :code.definition/type-cid definitions))
          types (filterv #(and (contains? needed-types (:cid %))
                               (nil? (get-type target (:cid %))))
-                        types)]
+                       types)]
      (import-code-graph! target verify-host verify-internal {:types types :definitions definitions})
      (let [artifact (when compiler-contract-cid
                       (find-artifact source code-root-cid compiler-contract-cid))
@@ -722,26 +745,13 @@
 (defn revoke-pin!
   "Auditably deactivate a pin. Physical deletion remains outside IStore."
   [s id reason]
-  (effect/guard!
-   {:evaluate
-    (fn [{:keys [store pin-id revocation-reason]}]
-      (let [pin (store/-get store retention-pins pin-id)]
-        (require-value some? pin :retention/pin-not-found {:id pin-id})
-        (require-value string? revocation-reason
-                       :retention/reason-required {:id pin-id})
-        {:retention-revoke/allowed? true :retention-revoke/pin pin}))
-    :request {:store s :pin-id id :revocation-reason reason}
-    :approved? :retention-revoke/allowed?
-    :action :retention-pin/revoke
-    :resource id
-    :digest reason
-    :effect
-    (fn [decision]
-      (let [record (assoc (:retention-revoke/pin decision)
-                          :active? false :revocation-reason reason)]
-        (store/-put s retention-pins id record)
-        (store/-append s retention-stream {:op :revoke :id id :reason reason})
-        record))}))
+  (let [pin (store/-get s retention-pins id)]
+    (require-value some? pin :retention/pin-not-found {:id id})
+    (require-value string? reason :retention/reason-required {:id id})
+    (let [record (assoc pin :active? false :revocation-reason reason)]
+      (store/-put s retention-pins id record)
+      (store/-append s retention-stream {:op :revoke :id id :reason reason})
+      record)))
 
 (defn retention-roots [s]
   (set (keep (fn [id]
