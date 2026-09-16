@@ -56,6 +56,10 @@ operation, and Neo4j performance remain explicit open evidence gates.
 
 ## The physical plane: block → pack → object
 
+The accepted [IPLD/ADL/Selector responsibility contract](adr/2609060000-ipld-adl-selector-car-boundaries.md)
+extends this architecture with selective retrieval and explicit codec migration
+rules. Its unimplemented capabilities remain open gates.
+
 A block's **identity** is its CID. Where those bytes actually are is a separate
 question, and until 2026-08-16 this design answered it only by default: one
 object per CID. Superproject **ADR-2608160100** makes the answer explicit and
@@ -97,9 +101,15 @@ Compaction writes a new pack and repoints the catalog.
 pack holds this CID* is answered by `:block/pack` / `:block/file-offset` /
 `:block/frame-length` datoms, and *where inside that pack* by the CARv2
 `MultihashIndexSorted` the pack carries. The first is on the datom plane
-because it has to join with commits, tenants and lake objects (ADR-260726:
-join reach is exactly one ref). It is a **projection** — deleting it may only
-cost speed, because scanning the packs rebuilds it.
+because it has to join with commits, tenants and lake objects. What decides
+that reach is whether those are composed into one pattern source at query
+time, not how many refs they live under: root **ADR-2809040800** supersedes
+ADR-260726's "exactly one ref", which was an implementation ceiling read as a
+property of the data model. The catalog is therefore not required to share a
+ref with commits — it is required to be composed with them, and a catalog in a
+store nothing composes is an island whichever ref it sits in. It is a
+**projection** — deleting it may only cost speed, because scanning the packs
+rebuilds it.
 
 Large columnar objects do **not** go in packs. A Parquet or Arrow file stays a
 large object read through `:presigned-transfer` and a footer range; packing is
@@ -150,6 +160,30 @@ The historical `kotobase.store/IStore` document/stream API remains temporarily
 as a compatibility surface for existing murakumo/manimani consumers. New
 database backends must not implement or depend on it. It will move to a
 dedicated compatibility package after downstream consumers migrate.
+
+### Causal trust migration boundary
+
+`kotobase.causal-commit` is the canonical route for new identity transitions,
+LLM-attributed authority decisions, and protected-read receipts. A write names
+an exact immutable basis CID and returns a new commit CID; it neither consults
+nor publishes a mutable ref. The returned CID is reread through `at-cid` before
+the write is acknowledged. Protected rows carry both the causal receipt CID
+and the Kotobase commit CID that makes the receipt auditable.
+
+On ClojureScript/Workers the policy compiler may be a remote LLM, model, or
+agent. Its Promise, the evaluator Promise, every provider write, the exact-CID
+reread, and the receipt-sink Promise are all awaited. A failure at any stage
+rejects the operation and protected rows are not returned. The JVM uses the
+same validation and record format synchronously.
+
+`kotobase.causal-trust` remains the explicitly named compatibility route for
+existing `ITransactionalStore` consumers. Its numeric revision is not a
+canonical basis and must not be translated into, compared with, or presented
+as a Kotobase commit CID. Migration is new-write-first: old events remain
+readable through the compatibility API, while a consumer changes its write
+path to `causal-commit` and retains the returned commit CID. No bulk rewrite is
+implied, and copying a legacy event into a CID commit without preserving its
+original attribution would create a new record rather than repair history.
 
 Provider repositories:
 

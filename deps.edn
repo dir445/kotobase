@@ -7,44 +7,77 @@
  ;; fn — no HTTP client baked in, so it runs unchanged on JVM / cljs / a
  ;; Cloudflare Worker / kotoba-WASM) remain for compatibility; new persistence
  ;; targets `kotobase.core`.
- :deps {io.github.kotoba-lang/security {:git/url "https://github.com/kotoba-lang/security.git"
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+        io.github.kotoba-lang/security {:git/url "https://github.com/kotoba-lang/security.git"
                                         :git/sha "74235d1cdf8034334f01dcb2f6faaff0c731146e"}
         io.github.kotoba-lang/abi {:git/url "https://github.com/kotoba-lang/abi.git"
                                    :git/sha "32ee84b2efc92478c846629c8d8319280eed506c"}
+        io.github.kotoba-lang/identity
+        {:git/url "https://github.com/kotoba-lang/identity.git"
+         :git/sha "6e4a07eaf44e3dbebfb4b340fd4f11448490f71f"}
+        io.github.kotoba-lang/grant
+        {:git/url "https://github.com/kotoba-lang/grant.git"
+         :git/sha "9d7d11fc3d77b1f6dfcbcd6fa9dd7d83e6b8bf98"}
+        ;; The transitive arrangement/prolly path still names eec3ee8, whose
+        ;; reader-conditional ns form is not valid under the real
+        ;; ClojureScript compiler. Keep the Worker build on the fleet's
+        ;; qualified io-multiformats pin; this is a direct compile boundary,
+        ;; not a second implementation of CID primitives.
+        io.github.kotoba-lang/io-multiformats
+        {:git/url "https://github.com/kotoba-lang/io-multiformats.git"
+         :git/sha "561fe7dfada3db852b127f06d41750dabd3cead9"}
+        ;; `kotoba.value.codec` — the canonical `kotoba.value.v1` codec and the
+        ;; CIDv1 DAG-CBOR logical address of an admitted value. Direct because
+        ;; `kotobase.execution-identity` names it: the execution contract's
+        ;; identifiers are recomputed from the records rather than accepted
+        ;; from a caller, and that needs one canonical codec rather than
+        ;; whichever one a transitive path happens to select. Pinned to the sha
+        ;; the resolver already selects here, so no new diamond is introduced;
+        ;; it is `identical` to io-ipld's main.
+        io.github.kotoba-lang/io-ipld
+        {:git/url "https://github.com/kotoba-lang/io-ipld.git"
+         :git/sha "48ba40490cf082a1473986ac757b8e2b214a3d1b"}
         ;; kotobase.core delegates to the engine, which speaks the
         ;; provider-neutral storage contract. Concrete providers (postgres, d1,
         ;; s3, ipfs, sqlite) are chosen by the host and passed in as `:storage`;
         ;; none of them are dependencies here.
         io.github.kotoba-lang/kotobase-storage
         {:git/url "https://github.com/kotoba-lang/kotobase-storage.git"
-         :git/sha "5cbf6c5107ad49c0daac14dca118c837053de0d6"}
+         :git/sha "e52ddaad020e7d9f790a1839cf77e69f97ff731e"}
         io.github.kotoba-lang/kotobase-engine
         {:git/url "https://github.com/kotoba-lang/kotobase-engine.git"
-         :git/sha "bdc057bef0bc88b289f6f24e086a50884ee363c4"}}
+         :git/sha "b8b163e889341cdf49217570380872e0575fcbdd"}}
  :aliases
  {:cljs-test {:extra-paths ["test"]
               :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.kotoba-lang/security {:local/root "../security"}
                       io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
   :integration {:extra-paths ["test-integration"]
                 :extra-deps {io.github.kotoba-lang/kotoba
                              {:local/root "../kotoba"}
                              io.github.cognitect-labs/test-runner
-                             {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                             {:git/tag "v0.5.1" :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
                 :main-opts ["-m" "cognitect.test-runner" "-d" "test-integration"]}
   :cid-conformance
-  {:replace-paths ["qualification"]
+  {:replace-paths ["src" "qualification"]
    :replace-deps
    {org.clojure/clojure {:mvn/version "1.12.0"}
+    io.github.kotoba-lang/org-nist-sha2
+    {:git/url "https://github.com/kotoba-lang/org-nist-sha2.git"
+     :git/sha "cb67e53e590e0999d741523797729a3d747cda95"}
     io.github.kotoba-lang/compiler
     {:git/url "https://github.com/kotoba-lang/compiler.git"
      :git/sha "3febafca47ec89eb7167a7756cdd3fd579686dc3"}
     io.github.cognitect-labs/test-runner
-    {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+    {:git/tag "v0.5.1" :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
    :main-opts ["-m" "cognitect.test-runner" "-d" "qualification"]}
        ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
        :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
